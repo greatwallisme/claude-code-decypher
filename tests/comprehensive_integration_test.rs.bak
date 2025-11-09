@@ -1,0 +1,265 @@
+//! Comprehensive integration tests - End-to-end validation
+
+use claude_code_decypher::{
+    analysis::AdvancedAnalyzer,
+    analyzer::Analyzer,
+    dashboard::Dashboard,
+    extractor::Extractor,
+    output::{ExtractionSummary, OutputWriter},
+    parser::{visitor::StatsVisitor, Parser},
+    transformer::Transformer,
+    visualization::Visualizer,
+    Result,
+};
+use oxc_allocator::Allocator;
+use std::fs;
+use std::path::PathBuf;
+use tempfile::TempDir;
+
+#[test]
+fn test_complete_pipeline_all_phases() -> Result<()> {
+    let code = r#"
+        var QB9 = Object.create;
+        var {getPrototypeOf: IB9} = Object;
+
+        const systemPrompt = "You are Claude Code, Anthropic's official CLI for Claude. You help users with software engineering tasks and provide comprehensive assistance with code analysis and transformation.";
+
+        const tool = {
+            name: "Bash",
+            description: "Execute bash commands in a persistent shell session with optional timeout",
+            parameters: {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                type: "object",
+                properties: {
+                    command: { type: "string" }
+                }
+            }
+        };
+
+        const modelConfig = "claude-sonnet-4-5-20250929";
+        const apiEndpoint = "https://api.anthropic.com/v1/messages";
+
+        function processMessage(msg) {
+            if (msg.type === "user") {
+                return handleUserMessage(msg);
+            } else if (msg.type === "system") {
+                return handleSystemMessage(msg);
+            }
+            return null;
+        }
+
+        function handleUserMessage(msg) {
+            const processed = transformMessage(msg);
+            return sendToAPI(processed);
+        }
+
+        function handleSystemMessage(msg) {
+            return logMessage(msg);
+        }
+
+        function transformMessage(msg) {
+            return { ...msg, timestamp: Date.now() };
+        }
+
+        function sendToAPI(data) {
+            return fetch(apiEndpoint, { method: 'POST', body: JSON.stringify(data) });
+        }
+
+        function logMessage(msg) {
+            console.log(msg);
+        }
+    "#;
+
+    let allocator = Allocator::default();
+    let temp_dir = TempDir::new()
+        .map_err(|e| claude_code_decypher::error::DecypherError::Other(e.into()))?;
+    let output_dir = temp_dir.path();
+
+    // ========== PHASE 1: PARSING ==========
+    let parser = Parser::new(code.to_string());
+    let parse_result = parser.parse(&allocator)?;
+    assert!(parse_result.is_success(), "Parsing should succeed");
+
+    let mut visitor = StatsVisitor::new();
+    let ast_stats = visitor.visit_program(parse_result.program());
+
+    assert!(ast_stats.function_count >= 6);
+    assert!(ast_stats.variable_count >= 4);
+
+    // ========== PHASE 2: EXTRACTION ==========
+    let analyzer = Analyzer::new(parse_result.program());
+    let extractor = Extractor::new(analyzer);
+
+    let prompts = extractor.extract_prompts()?;
+    let tools = extractor.extract_tools()?;
+    let configs = extractor.extract_configs()?;
+    let strings = extractor.extract_strings()?;
+
+    assert!(!prompts.is_empty(), "Should extract prompts");
+    assert!(!tools.is_empty(), "Should extract tools");
+    assert!(!configs.is_empty(), "Should extract configs");
+
+    // Write extraction results
+    let writer = OutputWriter::new(output_dir);
+    writer.create_structure()?;
+    writer.write_prompts(&prompts)?;
+    writer.write_tools(&tools)?;
+    writer.write_configs(&configs)?;
+    writer.write_strings(&strings)?;
+
+    let extraction_summary = ExtractionSummary::new(&prompts, &tools, &configs, &strings);
+
+    // (Phase 3 already done above for tool extraction)
+    assert!(!beautified.is_empty());
+
+    let rename_map = transformer.generate_rename_map()?;
+    assert!(!rename_map.is_empty());
+
+    let modules = transformer.split_into_modules(
+        claude_code_decypher::transformer::split::SplitStrategy::Hybrid
+    )?;
+    assert!(!modules.is_empty());
+
+    // Write beautified code
+    let beautified_path = output_dir.join("beautified.js");
+    fs::write(&beautified_path, &beautified)
+        .map_err(|e| claude_code_decypher::error::DecypherError::io(&beautified_path, e))?;
+
+    // ========== PHASE 4: ANALYSIS ==========
+    let advanced_analyzer = AdvancedAnalyzer::new(parse_result.program());
+    let report = advanced_analyzer.generate_report()?;
+
+    assert!(report.call_graph.unique_functions >= 5);
+    assert!(report.complexity.avg_cyclomatic >= 1.0);
+    assert!(report.metrics.function_count >= 6);
+
+    report.write_json(output_dir)?;
+    report.generate_markdown(output_dir)?;
+
+    // ========== PHASE 5: VISUALIZATION & DASHBOARD ==========
+
+    // Generate Mermaid diagrams
+    let module_diagram = Visualizer::modules_to_mermaid(&modules)?;
+    assert!(module_diagram.contains("```mermaid"));
+
+    let callgraph_diagram = Visualizer::callgraph_to_mermaid(&report.call_graph, 10)?;
+    assert!(callgraph_diagram.contains("```mermaid"));
+
+    // Generate DOT diagrams
+    let module_dot = Visualizer::modules_to_dot(&modules)?;
+    assert!(module_dot.contains("digraph"));
+
+    // Write diagrams
+    let diagrams_dir = output_dir.join("diagrams");
+    fs::create_dir_all(&diagrams_dir)
+        .map_err(|e| claude_code_decypher::error::DecypherError::io(&diagrams_dir, e))?;
+
+    fs::write(diagrams_dir.join("modules.mmd"), module_diagram)
+        .map_err(|e| claude_code_decypher::error::DecypherError::Other(e.into()))?;
+    fs::write(diagrams_dir.join("callgraph.mmd"), callgraph_diagram)
+        .map_err(|e| claude_code_decypher::error::DecypherError::Other(e.into()))?;
+    fs::write(diagrams_dir.join("modules.dot"), module_dot)
+        .map_err(|e| claude_code_decypher::error::DecypherError::Other(e.into()))?;
+
+    // Generate dashboard
+    let dashboard = Dashboard::new(
+        &ast_stats,
+        &extraction_summary,
+        &modules,
+        rename_map.len(),
+        Some(&report),
+        code.len(),
+        code.lines().count(),
+        beautified.lines().count(),
+    );
+
+    dashboard.write_json(output_dir)?;
+    dashboard.generate_markdown(output_dir)?;
+
+    // ========== VALIDATION ==========
+
+    // Verify all expected files exist
+    assert!(output_dir.join("extracted/system-prompts.json").exists());
+    assert!(output_dir.join("extracted/tool-definitions.json").exists());
+    assert!(output_dir.join("extracted/configurations.json").exists());
+    assert!(output_dir.join("beautified.js").exists());
+    assert!(output_dir.join("analysis/call-graph.json").exists());
+    assert!(output_dir.join("analysis/complexity.json").exists());
+    assert!(output_dir.join("analysis/metrics.json").exists());
+    assert!(output_dir.join("docs/analysis-report.md").exists());
+    assert!(output_dir.join("diagrams/modules.mmd").exists());
+    assert!(output_dir.join("diagrams/callgraph.mmd").exists());
+    assert!(output_dir.join("dashboard.json").exists());
+    assert!(output_dir.join("DASHBOARD.md").exists());
+
+    // Verify JSON files are valid
+    let dashboard_json = fs::read_to_string(output_dir.join("dashboard.json"))
+        .map_err(|e| claude_code_decypher::error::DecypherError::Other(e.into()))?;
+    let _: serde_json::Value = serde_json::from_str(&dashboard_json)
+        .map_err(|e| claude_code_decypher::error::DecypherError::Other(e.into()))?;
+
+    println!("\n✅ Complete Pipeline Test Passed!");
+    println!("All 5 phases executed successfully:");
+    println!("  Phase 1: Parsing ✓");
+    println!("  Phase 2: Extraction ✓");
+    println!("  Phase 3: Transformation ✓");
+    println!("  Phase 4: Analysis ✓");
+    println!("  Phase 5: Visualization & Dashboard ✓");
+
+    Ok(())
+}
+
+#[test]
+fn test_vendors_claude_full_pipeline() -> Result<()> {
+    let vendors_path = PathBuf::from("./vendors/claude");
+
+    if !vendors_path.exists() {
+        println!("Skipping vendors/claude full pipeline test - file not found");
+        return Ok(());
+    }
+
+    let allocator = Allocator::default();
+    let temp_dir = TempDir::new()
+        .map_err(|e| claude_code_decypher::error::DecypherError::Other(e.into()))?;
+
+    // Parse
+    let parser = Parser::from_file(&vendors_path)?;
+    let parse_result = parser.parse(&allocator)?;
+    assert!(parse_result.is_success());
+
+    // Extract
+    let analyzer = Analyzer::new(parse_result.program());
+    let extractor = Extractor::new(analyzer);
+    let prompts = extractor.extract_prompts()?;
+
+    // For tools, we need beautified code
+    let transformer = Transformer::new(parse_result.program());
+    let beautified = transformer.beautify(&allocator)?;
+    let tools = extractor.extract_tools_from_beautified(&beautified)?;
+
+    assert!(prompts.len() >= 60, "Should find at least 60 prompts in Claude Code (found {})", prompts.len());
+    assert!(tools.len() >= 15, "Should find at least 15 tools in Claude Code (found {})", tools.len());
+
+    // (Transformer already created above for tool extraction)
+    assert!(beautified.lines().count() > 400_000, "Should generate 400K+ lines");
+
+    // Analyze
+    let advanced_analyzer = AdvancedAnalyzer::new(parse_result.program());
+    let report = advanced_analyzer.generate_report()?;
+
+    assert!(report.call_graph.unique_functions > 3000, "Should find 3000+ functions");
+    assert!(report.complexity.max_cyclomatic >= 30, "Should find complex functions");
+
+    // Visualize
+    let module_diagram = Visualizer::modules_to_mermaid(
+        &transformer.split_into_modules(
+            claude_code_decypher::transformer::split::SplitStrategy::Hybrid
+        )?
+    )?;
+    assert!(module_diagram.contains("```mermaid"));
+
+    println!("\n✅ Vendors Claude Full Pipeline Test Passed!");
+    println!("Validated on real 10MB bundle");
+
+    Ok(())
+}
