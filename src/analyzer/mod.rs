@@ -169,29 +169,36 @@ impl<'a> StringLiteralCollector<'a> {
                 }
             }
             Expression::CallExpression(call) => {
-                // Visit call expression arguments
+                // Visit call expression arguments (including arrow functions!)
                 for arg in &call.arguments {
                     match arg {
                         Argument::SpreadElement(spread) => {
                             self.visit_expression(&spread.argument);
+                        }
+                        Argument::ArrowFunctionExpression(arrow) => {
+                            // Visit arrow function body to get strings inside lazy_init blocks
+                            for stmt in &arrow.body.statements {
+                                self.visit_statement(stmt);
+                            }
+                        }
+                        Argument::FunctionExpression(func) => {
+                            if let Some(body) = &func.body {
+                                for stmt in &body.statements {
+                                    self.visit_statement(stmt);
+                                }
+                            }
                         }
                         _ => {}
                     }
                 }
             }
             Expression::TemplateLiteral(tmpl) => {
-                // Extract template literal quasi strings
-                for quasi in &tmpl.quasis {
-                    let value = quasi.value.raw.as_str();
-                    if !value.is_empty() {
-                        self.literals.push(StringLiteralInfo {
-                            value,
-                            length: value.len(),
-                            line_hint: None,
-                        });
-                    }
-                }
-                // Visit template expressions
+                // CONCRETE SOLUTION: DON'T extract individual quasis!
+                // Template literals are properly extracted via Symbol Table
+                // which joins all quasis into complete strings.
+                // Extracting quasis here causes fragmentation.
+
+                // Only visit nested expressions (don't extract quasis)
                 for expr in &tmpl.expressions {
                     self.visit_expression(expr);
                 }
@@ -278,9 +285,15 @@ impl<'a> ObjectCollector<'a> {
                                 _ => None,
                             };
 
+                            // Check if value is a function (method or function expression)
+                            let is_function = p.method || matches!(
+                                &p.value,
+                                Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_)
+                            );
+
                             Some(PropertyInfo {
                                 key,
-                                is_method: p.method,
+                                is_method: is_function,  // TRUE for both methods and function expressions
                                 string_value,
                                 identifier_value,
                             })

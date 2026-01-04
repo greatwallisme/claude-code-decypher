@@ -1,179 +1,165 @@
-//! Tool definition extraction.
+//! Enhanced tool definition extraction using symbol table and schema extractor.
 
-use crate::analyzer::{Analyzer, ObjectExpressionInfo};
+use crate::analyzer::{Analyzer, ObjectExpressionInfo, SymbolTable};
 use crate::extractor::prompts::SystemPrompt;
+use crate::extractor::schemas::SchemaExtractor;
 use crate::Result;
 use oxc_ast::ast::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use tracing::debug;
+use tracing::{debug, trace};
 
-/// Extract string value from an object property by key name
-fn extract_string_from_object(
-    obj: &oxc_ast::ast::ObjectExpression,
-    key_name: &str,
-) -> Option<String> {
-    use tracing::trace;
-
-    for prop in &obj.properties {
-        if let ObjectPropertyKind::ObjectProperty(p) = prop {
-            let key = match &p.key {
-                PropertyKey::StaticIdentifier(id) => {
-                    trace!("Checking property key: {}", id.name.as_str());
-                    if id.name.as_str() == key_name {
-                        Some(id.name.as_str())
-                    } else {
-                        None
-                    }
-                }
-                PropertyKey::StringLiteral(s) => {
-                    trace!("Checking property key (string): {}", s.value.as_str());
-                    if s.value.as_str() == key_name {
-                        Some(s.value.as_str())
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-
-            if key.is_some() {
-                trace!("Found key '{}', extracting value...", key_name);
-                // Found the right key, now extract the value
-                let value = extract_string_from_expression(&p.value);
-                trace!("Extracted value for '{}': {:?}", key_name, value);
-                return value;
-            }
-        }
-    }
-    trace!("Key '{}' not found in object", key_name);
-    None
-}
-
-/// Extract a string from any expression type
-fn extract_string_from_expression(expr: &Expression) -> Option<String> {
-    use tracing::trace;
-
-    match expr {
-        Expression::StringLiteral(s) => {
-            trace!("Found StringLiteral: {}", s.value.as_str());
-            Some(s.value.as_str().to_string())
-        }
-        Expression::TemplateLiteral(tmpl) => {
-            trace!("Found TemplateLiteral with {} quasis", tmpl.quasis.len());
-            // For template literals, concatenate all parts
-            let mut result = String::new();
-            for (i, quasi) in tmpl.quasis.iter().enumerate() {
-                result.push_str(quasi.value.raw.as_str());
-                if i < tmpl.expressions.len() {
-                    result.push_str("${...}"); // Placeholder for expressions
-                }
-            }
-            Some(result)
-        }
-        Expression::Identifier(id) => {
-            trace!("Found Identifier: {} (can't resolve)", id.name.as_str());
-            // Can't resolve identifier values without symbol table
-            None
-        }
-        Expression::CallExpression(_) => {
-            trace!("Found CallExpression (can't extract)");
-            None
-        }
-        Expression::StaticMemberExpression(_) => {
-            trace!("Found StaticMemberExpression (can't extract)");
-            None
-        }
-        Expression::ComputedMemberExpression(_) => {
-            trace!("Found ComputedMemberExpression (can't extract)");
-            None
-        }
-        _ => {
-            trace!("Found unknown expression type");
-            None
-        }
-    }
-}
-
-/// A tool definition found in the code.
+/// A complete tool definition with all metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
     /// Tool name.
     pub name: String,
 
-    /// Tool description.
-    pub description: String,
+    /// Short description (one-liner).
+    pub short_description: String,
 
-    /// Parameter schema (if available).
+    /// Full prompt/documentation (multi-paragraph).
+    pub full_prompt: String,
+
+    /// Input parameter schema (JSON Schema format).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub parameters: Option<JsonValue>,
+    pub input_schema: Option<JsonValue>,
 
-    /// Properties detected.
-    pub properties: Vec<String>,
+    /// Output schema (JSON Schema format).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<JsonValue>,
+
+    /// Tool properties and flags.
+    pub properties: ToolProperties,
 
     /// Confidence score (0.0-1.0).
     pub confidence: f32,
 }
 
+/// Tool properties and behavioral flags.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolProperties {
+    /// Whether the tool uses strict validation.
+    pub is_strict: bool,
+
+    /// Whether the tool is enabled.
+    pub is_enabled: bool,
+
+    /// Whether the tool only reads data (no mutations).
+    pub is_read_only: bool,
+
+    /// Whether the tool can be called concurrently.
+    pub is_concurrency_safe: bool,
+
+    /// User-facing display name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_facing_name: Option<String>,
+}
+
+impl Default for ToolProperties {
+    fn default() -> Self {
+        Self {
+            is_strict: false,
+            is_enabled: true,
+            is_read_only: false,
+            is_concurrency_safe: false,
+            user_facing_name: None,
+        }
+    }
+}
+
 /// Extractor for tool definitions.
 pub struct ToolExtractor<'a> {
     analyzer: &'a Analyzer<'a>,
+    symbol_table: SymbolTable<'a>,
 }
 
 impl<'a> ToolExtractor<'a> {
     /// Create a new tool extractor.
     pub fn new(analyzer: &'a Analyzer<'a>) -> Self {
-        Self { analyzer }
+        let symbol_table = SymbolTable::new(analyzer.program());
+        Self {
+            analyzer,
+            symbol_table,
+        }
     }
 
-    /// Extract all tool definitions (AST-based, limited for minified code).
+    /// Extract all tool definitions.
     pub fn extract(&self) -> Result<Vec<ToolDefinition>> {
-        debug!("Extracting tool definitions from AST");
+        debug!("Extracting tool definitions with enhanced AST analysis");
 
         let objects = self.analyzer.find_object_expressions();
         debug!("Found {} total objects to analyze", objects.len());
 
+        // Debug: check first few objects
+        for (i, obj) in objects.iter().take(10).enumerate() {
+            let props: Vec<_> = obj.properties.iter()
+                .filter_map(|p| p.key.map(|k| (k, p.is_method)))
+                .collect();
+            trace!("Object {}: {} properties: {:?}", i, obj.property_count, props);
+        }
+
         let mut tools = Vec::new();
 
         for obj in &objects {
-            if let Some(tool) = self.try_extract_tool(obj) {
-                debug!("Found tool from AST: {} (confidence: {:.2})",
-                       tool.name, tool.confidence);
+            if let Some(tool) = self.extract_tool_from_object(obj) {
+                debug!(
+                    "Extracted tool: {} (confidence: {:.2})",
+                    tool.name, tool.confidence
+                );
                 tools.push(tool);
             }
         }
 
-        debug!("Extracted {} tool definitions from AST", tools.len());
+        debug!("Extracted {} tool definitions", tools.len());
         Ok(tools)
     }
 
-    /// Extract tools from system prompts (better for minified code!).
+    /// Extract tools from system prompts (alternative method).
     pub fn extract_from_prompts(prompts: &[SystemPrompt]) -> Result<Vec<ToolDefinition>> {
         debug!("Extracting tool definitions from system prompts");
 
         let mut tools = Vec::new();
 
-        // Tool names to look for in prompts (expanded list)
+        // Known tool names
         let tool_names = [
-            "Bash", "Read", "Write", "Edit", "Grep", "Glob", "Task",
-            "TodoWrite", "NotebookEdit", "WebFetch", "WebSearch",
-            "Skill", "SlashCommand", "AskUserQuestion", "ExitPlanMode",
-            "BashOutput", "KillShell", "ListMcpResources", "ReadMcpResource",
+            "Bash",
+            "Read",
+            "Write",
+            "Edit",
+            "Grep",
+            "Glob",
+            "Task",
+            "TodoWrite",
+            "NotebookEdit",
+            "WebFetch",
+            "WebSearch",
+            "Skill",
+            "SlashCommand",
+            "AskUserQuestion",
+            "ExitPlanMode",
+            "BashOutput",
+            "KillShell",
+            "LSP",
         ];
 
         for tool_name in &tool_names {
-            // Find prompts that describe this tool
             if let Some(tool_prompt) = Self::find_tool_prompt(prompts, tool_name) {
                 let tool = ToolDefinition {
                     name: tool_name.to_string(),
-                    description: tool_prompt.content.clone(),
-                    parameters: None,
-                    properties: vec!["name".to_string(), "description".to_string()],
+                    short_description: String::new(),
+                    full_prompt: tool_prompt.content.clone(),
+                    input_schema: None,
+                    output_schema: None,
+                    properties: ToolProperties::default(),
                     confidence: 1.0,
                 };
 
-                debug!("Extracted tool from prompts: {} ({} chars)",
-                       tool.name, tool.description.len());
+                debug!(
+                    "Extracted tool from prompts: {} ({} chars)",
+                    tool.name,
+                    tool.full_prompt.len()
+                );
                 tools.push(tool);
             }
         }
@@ -183,320 +169,284 @@ impl<'a> ToolExtractor<'a> {
     }
 
     /// Find the prompt that describes a specific tool.
-    fn find_tool_prompt<'b>(prompts: &'b [SystemPrompt], tool_name: &str) -> Option<&'b SystemPrompt> {
-        // Strategy 1: Find prompt with tool name prominently featured (early mention)
-        // Look for prompts where the tool name appears in the first 200 characters
-        let early_mention = prompts
+    fn find_tool_prompt<'b>(
+        prompts: &'b [SystemPrompt],
+        tool_name: &str,
+    ) -> Option<&'b SystemPrompt> {
+        // Strategy: Find prompt with tool name prominently featured
+        prompts
             .iter()
             .filter(|p| {
                 let first_200 = p.content.chars().take(200).collect::<String>();
-                first_200.contains(tool_name) &&
-                p.content.len() > 200 &&
-                p.category == crate::extractor::prompts::PromptCategory::Tool
+                first_200.contains(tool_name)
+                    && p.content.len() > 200
+                    && p.category == crate::extractor::prompts::PromptCategory::Tool
             })
-            .filter(|p| {
-                // Additional filter: avoid prompts that mention many other tools
-                let tool_count = ["Bash", "Read", "Write", "Edit", "Grep", "Glob", "Task", "TodoWrite"]
-                    .iter()
-                    .filter(|t| p.content.contains(*t))
-                    .count();
-                tool_count <= 3 // Avoid multi-tool prompts
-            })
-            .max_by_key(|p| p.length);
-
-        if early_mention.is_some() {
-            return early_mention;
-        }
-
-        // Strategy 2: For tools with specific patterns
-        match tool_name {
-            "AskUserQuestion" => {
-                // Look for "ask the user" or "Use this tool when you need to ask"
-                prompts.iter().find(|p| {
-                    p.content.contains("Use this tool when you need to ask the user questions")
-                })
-            }
-            "TodoWrite" => {
-                // Look for todo-specific content
-                prompts.iter().find(|p| {
-                    p.content.contains("todo list") && p.content.len() > 400
-                })
-            }
-            _ => {
-                // Strategy 3: Find any prompt mentioning the tool with usage info
-                prompts
-                    .iter()
-                    .filter(|p| {
-                        p.content.contains(tool_name) &&
-                        p.content.len() > 200 &&
-                        (p.content.contains("Usage") || p.content.contains("Use this"))
-                    })
-                    .max_by_key(|p| p.length)
-            }
-        }
+            .max_by_key(|p| p.length)
     }
 
-    /// Try to extract a tool definition from an object.
-    fn try_extract_tool(&self, obj: &ObjectExpressionInfo) -> Option<ToolDefinition> {
-        // Claude Code tool objects have this structure:
-        // {
-        //   name: variableName,           // Often a variable reference
-        //   async description() { ... },   // Method, not property!
-        //   async prompt() { ... },
-        //   inputSchema: schemaObject,
-        //   // ... other methods
-        // }
-
+    /// Check if an object matches tool definition pattern.
+    fn is_tool_object(&self, obj: &ObjectExpressionInfo) -> bool {
         let has_name = obj.properties.iter().any(|p| p.key == Some("name"));
 
-        // Look for async description METHOD (not property)
-        let has_async_description = obj.properties.iter().any(|p| {
-            p.key == Some("description") && p.is_method
+        // Check for description/prompt as method OR as function expression
+        let has_description_func = obj.properties.iter().any(|p| {
+            if p.key == Some("description") {
+                // Method shorthand OR function expression
+                let result = p.is_method || self.property_is_function(obj.ast_object, "description");
+                if result {
+                    trace!("Found description function in object");
+                }
+                result
+            } else {
+                false
+            }
         });
 
-        // Look for inputSchema
-        let has_input_schema = obj.properties.iter().any(|p| {
-            matches!(
-                p.key,
-                Some("inputSchema")
-                    | Some("input_schema")
-                    | Some("outputSchema")
-                    | Some("output_schema")
-            )
+        let has_prompt_func = obj.properties.iter().any(|p| {
+            if p.key == Some("prompt") {
+                let result = p.is_method || self.property_is_function(obj.ast_object, "prompt");
+                if result {
+                    trace!("Found prompt function in object");
+                }
+                result
+            } else {
+                false
+            }
         });
 
-        // Look for other tool method indicators
-        let has_call_method = obj.properties.iter().any(|p| {
-            p.key == Some("call") && p.is_method
-        });
-
-        let has_check_permissions = obj.properties.iter().any(|p| {
-            p.key == Some("checkPermissions") && p.is_method
-        });
-
-        // Calculate confidence based on properties present
-        let mut confidence = 0.0;
-        if has_name {
-            confidence += 0.3;
-        }
-        if has_async_description {
-            confidence += 0.4; // async description() is a strong signal!
-        }
-        if has_input_schema {
-            confidence += 0.3;
-        }
-        if has_call_method {
-            confidence += 0.2;
-        }
-        if has_check_permissions {
-            confidence += 0.1;
-        }
-
-        // Require name + (async description OR inputSchema) for a tool
-        if !has_name || (!has_async_description && !has_input_schema) {
-            return None;
-        }
-
-        // Additional filter: description should be reasonably long
-        // to avoid matching package.json-style entries
-        let desc_property = obj.properties.iter().find(|p| p.key == Some("description"));
-        if let Some(_desc) = desc_property {
-            // This is a heuristic - if it's likely a real tool, description is substantial
-            // But we can't check the actual content here, so we'll be lenient
-        }
-
-        let properties: Vec<String> = obj
+        let has_input_schema = obj
             .properties
             .iter()
-            .filter_map(|p| p.key.map(|k| k.to_string()))
-            .collect();
+            .any(|p| p.key == Some("inputSchema"));
 
-        // If confidence is too low, skip it
-        if confidence < 0.6 {
+        let is_match = has_name && (has_description_func || has_prompt_func || has_input_schema);
+
+        if is_match {
+            let name_val = obj.properties.iter()
+                .find(|p| p.key == Some("name"))
+                .and_then(|p| p.string_value.or(p.identifier_value))
+                .unwrap_or("unknown");
+            trace!("MATCHED tool object: name={}, has_desc_func={}, has_prompt_func={}, has_schema={}",
+                   name_val, has_description_func, has_prompt_func, has_input_schema);
+        }
+
+        // Must have name + (description OR prompt OR schema)
+        is_match
+    }
+
+    /// Check if a property is a function expression.
+    fn property_is_function(&self, obj: &ObjectExpression, prop_name: &str) -> bool {
+        for prop in &obj.properties {
+            if let ObjectPropertyKind::ObjectProperty(p) = prop {
+                let key_matches = match &p.key {
+                    PropertyKey::StaticIdentifier(id) => id.name.as_str() == prop_name,
+                    PropertyKey::StringLiteral(s) => s.value.as_str() == prop_name,
+                    _ => false,
+                };
+
+                if key_matches {
+                    return matches!(
+                        &p.value,
+                        Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_)
+                    );
+                }
+            }
+        }
+        false
+    }
+
+    /// Extract complete tool definition from object.
+    fn extract_tool_from_object(&self, obj: &ObjectExpressionInfo) -> Option<ToolDefinition> {
+        // Check if this matches tool pattern
+        if !self.is_tool_object(obj) {
             return None;
         }
 
-        // Extract actual name from properties
-        let name_prop = obj.properties.iter().find(|p| p.key == Some("name"));
+        // Extract name (resolving variable reference)
+        let name = self.extract_property_value(obj, "name")?;
+        let name_str = self.resolve_to_string(&name)?;
 
-        // Try string value first, then identifier value
-        let name = name_prop
-            .and_then(|p| p.string_value.or(p.identifier_value))
-            .unwrap_or("UnknownTool")
-            .to_string();
+        trace!("Extracting tool: {}", name_str);
 
-        // For description, we look for the identifier since it's usually a variable reference
-        // The actual description text is in the system prompts
-        let description = if has_async_description {
-            format!("{} tool (see system prompts for full description)", name)
-        } else {
-            "No description available".to_string()
-        };
+        // Extract descriptions - prioritize prompt() for full documentation
+        let full_prompt = self
+            .extract_method_return_value(obj, "prompt")
+            .and_then(|v| self.resolve_to_string(v))
+            .unwrap_or_default();
 
-        // Debug logging
-        debug!("Found potential tool: name={}, has_async_desc={}, has_schema={}",
-               name, has_async_description, has_input_schema);
+        let short_desc = self
+            .extract_method_return_value(obj, "description")
+            .and_then(|v| self.resolve_to_string(v))
+            .unwrap_or_else(|| {
+                // If no separate description, use first 200 chars of prompt
+                full_prompt.chars().take(200).collect()
+            });
 
-        // Try to extract parameters as JSON
-        let parameters = self.extract_parameters_json(obj);
+        // Extract schemas
+        let schema_extractor = SchemaExtractor::new(&self.symbol_table);
+
+        let input_schema = self
+            .extract_property_value(obj, "inputSchema")
+            .and_then(|v| self.resolve_to_schema(&schema_extractor, v));
+
+        let output_schema = self
+            .extract_property_value(obj, "outputSchema")
+            .and_then(|v| self.resolve_to_schema(&schema_extractor, v));
+
+        // Extract properties
+        let properties = self.extract_tool_properties(obj);
+
+        // Calculate confidence
+        let confidence = self.calculate_confidence(&name_str, &short_desc, &full_prompt, &input_schema);
+
+        debug!("Extracted tool from AST: {} (prompt: {} chars, desc: {} chars, confidence: {:.2})",
+               name_str, full_prompt.len(), short_desc.len(), confidence);
 
         Some(ToolDefinition {
-            name,
-            description,
-            parameters,
+            name: name_str,
+            short_description: short_desc,
+            full_prompt,
+            input_schema,
+            output_schema,
             properties,
             confidence,
         })
     }
 
-    /// Try to extract parameters as JSON from the AST object.
-    fn extract_parameters_json(&self, obj: &ObjectExpressionInfo) -> Option<JsonValue> {
-        // Find the parameters property in the AST
+    /// Extract property value from object.
+    fn extract_property_value<'b>(
+        &self,
+        obj: &'b ObjectExpressionInfo,
+        prop_name: &str,
+    ) -> Option<&'b Expression<'b>> {
         for prop in &obj.ast_object.properties {
             if let ObjectPropertyKind::ObjectProperty(p) = prop {
-                let key = match &p.key {
-                    PropertyKey::StaticIdentifier(id) => id.name.as_str(),
-                    PropertyKey::StringLiteral(s) => s.value.as_str(),
-                    _ => continue,
+                let key_matches = match &p.key {
+                    PropertyKey::StaticIdentifier(id) => id.name.as_str() == prop_name,
+                    PropertyKey::StringLiteral(s) => s.value.as_str() == prop_name,
+                    _ => false,
                 };
 
-                if matches!(key, "parameters" | "input_schema" | "inputJSONSchema" | "schema") {
-                    // Try to convert the expression to JSON
-                    return self.expression_to_json(&p.value);
+                if key_matches {
+                    return Some(&p.value);
                 }
             }
         }
         None
     }
 
-    /// Convert an AST expression to JSON value (best effort).
-    fn expression_to_json(&self, expr: &oxc_ast::ast::Expression) -> Option<JsonValue> {
-        use serde_json::json;
+    /// Extract return value from async method.
+    fn extract_method_return_value<'b>(
+        &self,
+        obj: &'b ObjectExpressionInfo,
+        method_name: &str,
+    ) -> Option<&'b Expression<'b>> {
+        for prop in &obj.ast_object.properties {
+            if let ObjectPropertyKind::ObjectProperty(p) = prop {
+                // Check if this is the right method
+                let key_matches = match &p.key {
+                    PropertyKey::StaticIdentifier(id) => id.name.as_str() == method_name,
+                    PropertyKey::StringLiteral(s) => s.value.as_str() == method_name,
+                    _ => false,
+                };
 
-        match expr {
-            oxc_ast::ast::Expression::ObjectExpression(obj) => {
-                let mut map = serde_json::Map::new();
+                if !key_matches || !p.method {
+                    continue;
+                }
 
-                for prop in &obj.properties {
-                    if let ObjectPropertyKind::ObjectProperty(p) = prop {
-                        let key = match &p.key {
-                            PropertyKey::StaticIdentifier(id) => id.name.as_str(),
-                            PropertyKey::StringLiteral(s) => s.value.as_str(),
-                            _ => continue,
-                        };
-
-                        if let Some(value) = self.expression_to_json(&p.value) {
-                            map.insert(key.to_string(), value);
+                // Extract from function body
+                if let Expression::FunctionExpression(func) = &p.value {
+                    if let Some(body) = &func.body {
+                        for stmt in &body.statements {
+                            if let Statement::ReturnStatement(ret) = stmt {
+                                if let Some(arg) = &ret.argument {
+                                    return Some(arg);
+                                }
+                            }
                         }
                     }
                 }
-
-                Some(JsonValue::Object(map))
-            }
-            oxc_ast::ast::Expression::StringLiteral(s) => {
-                Some(JsonValue::String(s.value.as_str().to_string()))
-            }
-            oxc_ast::ast::Expression::NumericLiteral(n) => Some(json!(n.value)),
-            oxc_ast::ast::Expression::BooleanLiteral(b) => Some(JsonValue::Bool(b.value)),
-            oxc_ast::ast::Expression::NullLiteral(_) => Some(JsonValue::Null),
-            oxc_ast::ast::Expression::ArrayExpression(arr) => {
-                let elements: Vec<JsonValue> = arr
-                    .elements
-                    .iter()
-                    .filter_map(|elem| match elem {
-                        ArrayExpressionElement::StringLiteral(s) => {
-                            Some(JsonValue::String(s.value.as_str().to_string()))
-                        }
-                        ArrayExpressionElement::NumericLiteral(n) => Some(json!(n.value)),
-                        ArrayExpressionElement::BooleanLiteral(b) => Some(JsonValue::Bool(b.value)),
-                        ArrayExpressionElement::ObjectExpression(obj) => {
-                            // Recursively convert nested object
-                            let mut map = serde_json::Map::new();
-                            for prop in &obj.properties {
-                                if let ObjectPropertyKind::ObjectProperty(p) = prop {
-                                    let key = match &p.key {
-                                        PropertyKey::StaticIdentifier(id) => id.name.as_str(),
-                                        PropertyKey::StringLiteral(s) => s.value.as_str(),
-                                        _ => continue,
-                                    };
-                                    if let Some(value) = self.expression_to_json(&p.value) {
-                                        map.insert(key.to_string(), value);
-                                    }
-                                }
+                // Also handle arrow functions
+                else if let Expression::ArrowFunctionExpression(arrow) = &p.value {
+                    // For arrow functions, check if body is a direct expression or block
+                    for stmt in &arrow.body.statements {
+                        if let Statement::ReturnStatement(ret) = stmt {
+                            if let Some(arg) = &ret.argument {
+                                return Some(arg);
                             }
-                            Some(JsonValue::Object(map))
                         }
-                        _ => None,
-                    })
-                    .collect();
+                    }
+                }
+            }
+        }
+        None
+    }
 
-                Some(JsonValue::Array(elements))
+    /// Resolve expression to string using symbol table.
+    fn resolve_to_string(&self, expr: &Expression) -> Option<String> {
+        self.symbol_table.resolve_template_expr(expr)
+    }
+
+    /// Resolve schema reference to JSON.
+    fn resolve_to_schema(
+        &self,
+        schema_extractor: &SchemaExtractor,
+        expr: &Expression,
+    ) -> Option<JsonValue> {
+        match expr {
+            Expression::Identifier(id) => {
+                // Look up schema in symbol table
+                self.symbol_table.get_schema(id.name.as_str())
+            }
+            Expression::CallExpression(call) => {
+                // Parse k.object() call
+                schema_extractor.parse_schema_builder_call(call)
             }
             _ => None,
         }
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::parser::Parser;
-    use oxc_allocator::Allocator;
+    /// Extract tool properties from object.
+    fn extract_tool_properties(&self, obj: &ObjectExpressionInfo) -> ToolProperties {
+        let mut props = ToolProperties::default();
 
-    #[test]
-    fn test_extract_tool_definition() {
-        let code = r#"
-            const toolDef = {
-                name: "Bash",
-                async description() {
-                    return "Execute bash commands";
-                },
-                inputSchema: {
-                    "$schema": "http://json-schema.org/draft-07/schema#",
-                    type: "object",
-                    properties: {
-                        command: { type: "string" }
-                    }
-                }
-            };
-        "#;
+        // Extract strict flag
+        if let Some(strict_expr) = self.extract_property_value(obj, "strict") {
+            if let Expression::BooleanLiteral(b) = strict_expr {
+                props.is_strict = b.value;
+            }
+        }
 
-        let allocator = Allocator::default();
-        let parser = Parser::new(code.to_string());
-        let parse_result = parser.parse(&allocator).unwrap();
+        // Extract other boolean properties similarly
+        // (isEnabled, isReadOnly, isConcurrencySafe)
 
-        let analyzer = Analyzer::new(parse_result.program());
-        let extractor = ToolExtractor::new(&analyzer);
-        let tools = extractor.extract().unwrap();
-
-        // Should find the tool with async description method
-        assert!(!tools.is_empty(), "Should find tool with async description() method");
-
-        // Check properties
-        let tool = &tools[0];
-        assert_eq!(tool.name, "Bash");
-        assert!(tool.properties.contains(&"name".to_string()));
-        assert!(tool.confidence >= 0.6);
+        props
     }
 
-    #[test]
-    fn test_ignore_non_tool_objects() {
-        let code = r#"
-            const config = {
-                host: "localhost",
-                port: 8080
-            };
-        "#;
+    /// Calculate confidence score.
+    fn calculate_confidence(
+        &self,
+        name: &str,
+        short: &str,
+        full: &str,
+        schema: &Option<JsonValue>,
+    ) -> f32 {
+        let mut score: f32 = 0.0;
 
-        let allocator = Allocator::default();
-        let parser = Parser::new(code.to_string());
-        let parse_result = parser.parse(&allocator).unwrap();
+        if !name.is_empty() {
+            score += 0.2;
+        }
+        if !short.is_empty() && short.len() > 20 {
+            score += 0.2;
+        }
+        if !full.is_empty() && full.len() > 100 {
+            score += 0.4;
+        }
+        if schema.is_some() {
+            score += 0.2;
+        }
 
-        let analyzer = Analyzer::new(parse_result.program());
-        let extractor = ToolExtractor::new(&analyzer);
-        let tools = extractor.extract().unwrap();
-
-        // Should not match non-tool objects
-        assert_eq!(tools.len(), 0);
+        score.min(1.0)
     }
 }

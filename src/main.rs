@@ -238,24 +238,29 @@ fn handle_extract_command(
     let writer = OutputWriter::new(output_dir);
     writer.create_structure()?;
 
-    // Extract data based on flags
-    let prompts = if !tools_only {
-        info!("Extracting system prompts...");
-        extractor.extract_prompts()?
+    // Extract enhanced prompts with fragment merging and tool association
+    let enhanced_prompts = if !tools_only {
+        info!("Extracting enhanced system prompts...");
+        extractor.extract_prompts_enhanced()?
     } else {
         Vec::new()
     };
 
-    // For tools, we need beautified code
-    let tools = if !prompts_only {
-        info!("Generating beautified code for tool extraction...");
-        let allocator = oxc_allocator::Allocator::default();
-        let transformer = Transformer::new(parse_result.program());
-        let beautified = transformer.beautify(&allocator)?;
-        let beautified = beautify_code(&beautified);
+    // Convert enhanced prompts to legacy format for backward compatibility
+    let prompts: Vec<_> = enhanced_prompts
+        .iter()
+        .map(|ep| claude_code_decypher::extractor::prompts::SystemPrompt {
+            id: ep.id.clone(),
+            content: ep.content.clone(),
+            length: ep.length,
+            category: ep.category.clone(),
+        })
+        .collect();
 
-        info!("Extracting tool definitions from beautified code...");
-        extractor.extract_tools_from_beautified(&beautified)?
+    // Extract tools with enhanced prompt matching
+    let tools = if !prompts_only {
+        info!("Extracting tool definitions with enhanced prompts...");
+        extractor.extract_tools_with_enhanced_prompts(&enhanced_prompts)?
     } else {
         Vec::new()
     };

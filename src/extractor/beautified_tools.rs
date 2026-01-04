@@ -4,7 +4,7 @@
 //! code, which is more effective than AST analysis for minified bundles.
 
 use crate::analyzer::SymbolTable;
-use crate::extractor::tools::ToolDefinition;
+use crate::extractor::tools::{ToolDefinition, ToolProperties};
 use crate::Result;
 use oxc_ast::ast::Program;
 use regex::Regex;
@@ -61,10 +61,18 @@ impl<'a> BeautifiedToolExtractor<'a> {
 
                 // Resolve template variables in description if we have a symbol table
                 let final_description = if let Some(desc) = description {
-                    if let Some(ref table) = self.symbol_table {
+                    let resolved = if let Some(ref table) = self.symbol_table {
                         table.resolve_template(&desc)
                     } else {
                         desc
+                    };
+
+                    // Validate that it's actual documentation, not code
+                    if Self::is_valid_description(&resolved) {
+                        resolved
+                    } else {
+                        // If it's garbage, use placeholder instead
+                        format!("Tool: {}", tool_name)
                     }
                 } else {
                     format!("Tool: {}", tool_name)
@@ -72,16 +80,20 @@ impl<'a> BeautifiedToolExtractor<'a> {
 
                 let tool = ToolDefinition {
                     name: tool_name.to_string(),
-                    description: final_description,
-                    parameters: None,
-                    properties: if has_schema {
-                        vec!["name".to_string(), "description".to_string(), "inputSchema".to_string()]
-                    } else {
-                        vec!["name".to_string(), "description".to_string()]
+                    short_description: final_description.chars().take(200).collect(),
+                    full_prompt: final_description.clone(),
+                    input_schema: None,
+                    output_schema: None,
+                    properties: ToolProperties {
+                        is_strict: false,
+                        is_enabled: true,
+                        is_read_only: false,
+                        is_concurrency_safe: false,
+                        user_facing_name: None,
                     },
-                    confidence: if has_desc && has_schema {
-                        1.0
-                    } else if has_desc {
+                    confidence: if final_description.starts_with("Tool:") {
+                        0.3 // Low confidence for placeholder
+                    } else if has_schema {
                         0.8
                     } else {
                         0.6
@@ -96,6 +108,42 @@ impl<'a> BeautifiedToolExtractor<'a> {
 
         debug!("Extracted {} tools from beautified code", tools.len());
         Ok(tools)
+    }
+
+    /// Validate that a description is actual documentation, not code.
+    fn is_valid_description(content: &str) -> bool {
+        // Reject if it looks like code
+        let code_indicators = [
+            "function(",
+            "async function",
+            "() =>",
+            "} catch {",
+            "throw Error(",
+            "stdio:",
+            ".forEach(",
+            ".map(",
+            "\t}",
+            "});",
+            "return !",
+        ];
+
+        let code_count = code_indicators.iter().filter(|&&ind| content.contains(ind)).count();
+        if code_count >= 2 {
+            return false;
+        }
+
+        // Reject if starts with code syntax
+        let trimmed = content.trim();
+        if trimmed.starts_with(",") || trimmed.starts_with("}") || trimmed.starts_with(")") || trimmed.starts_with(";") {
+            return false;
+        }
+
+        // Must have some prose characteristics
+        let has_sentences = content.contains(". ") || content.contains(".\n");
+        let has_prose_words = content.contains("the ") || content.contains("to ") || content.contains("this ");
+        let has_capitalized_start = trimmed.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
+
+        (has_sentences || has_prose_words) && has_capitalized_start
     }
 
     /// Check if a name is likely a tool name.
