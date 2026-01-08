@@ -1,8 +1,13 @@
 //! Code transformation module for beautifying and organizing code.
 
 pub mod advanced_split;
+pub mod code_assembler;
 pub mod codegen;
+pub mod dependency_analyzer;
 pub mod docs;
+pub mod function_extractor;
+pub mod import_generator;
+pub mod module_assigner;
 pub mod rename;
 pub mod sourcemap;
 pub mod split;
